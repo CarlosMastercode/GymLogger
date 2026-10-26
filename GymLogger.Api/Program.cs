@@ -19,8 +19,10 @@ var connectionString = builder.Configuration.GetConnectionString("GymLogger")
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-builder.Services.AddScoped<Npgsql.NpgsqlConnection>(_ =>
-    new Npgsql.NpgsqlConnection(connectionString));
+builder.Services.AddSingleton(
+    Npgsql.NpgsqlDataSource.Create(connectionString));
+
+builder.Services.AddScoped<GymLogger.Api.Authentication.SessionValidator>();
 
 var app = builder.Build();
 
@@ -40,11 +42,11 @@ var summaries = new[]
     "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
 };
 
-app.MapGet("/", () => Results.Ok(new {status= "Healthy" }));
+app.MapGet("/", () => Results.Ok(new { status = "Healthy" }));
 
-app.MapGet("/api/health/database", async (Npgsql.NpgsqlConnection connection) =>
+app.MapGet("/api/health/database", async (Npgsql.NpgsqlDataSource dataSource) =>
 {
-    await connection.OpenAsync();
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     await using var command = new Npgsql.NpgsqlCommand(
         "SELECT current_database()", connection);
@@ -60,7 +62,8 @@ app.MapGet("/api/health/database", async (Npgsql.NpgsqlConnection connection) =>
 
 app.MapPost("/api/users/register", async (
     RegisterUserRequest request,
-    Npgsql.NpgsqlConnection connection) =>
+    Npgsql.NpgsqlDataSource dataSource,
+    IWebHostEnvironment environment) =>
 {
     var firstName = request.FirstName?.Trim();
     var lastName = request.LastName?.Trim();
@@ -111,7 +114,7 @@ app.MapPost("/api/users/register", async (
         });
     }
 
-    await connection.OpenAsync();
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     await using var transaction = await connection.BeginTransactionAsync();
 
@@ -150,16 +153,67 @@ app.MapPost("/api/users/register", async (
 
         await contactCommand.ExecuteNonQueryAsync();
 
+        var verificationCode = RandomNumberGenerator.GetInt32(0, 1_000_000)
+            .ToString("D6");
+
+        var verificationCodeHash = Convert.ToHexString(
+            SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(verificationCode)));
+
+        const string insertChallengeSql = """
+            INSERT INTO auth_challenges (
+                user_email_id,
+                user_phone_id,
+                code_hash,
+                expires_at
+            )
+            SELECT
+                CASE WHEN @isEmail THEN id ELSE NULL END,
+                CASE WHEN @isEmail THEN NULL ELSE id END,
+                @codeHash,
+                NOW() + INTERVAL '5 minutes'
+            FROM (
+                SELECT id
+                FROM user_emails
+                WHERE user_id = @userId AND @isEmail = TRUE
+
+                UNION ALL
+
+                SELECT id
+                FROM user_phones
+                WHERE user_id = @userId AND @isEmail = FALSE
+            ) AS contact;
+            """;
+
+        await using var challengeCommand = new Npgsql.NpgsqlCommand(
+            insertChallengeSql, connection, transaction);
+
+        challengeCommand.Parameters.AddWithValue("userId", userId);
+        challengeCommand.Parameters.AddWithValue("isEmail", hasEmail);
+        challengeCommand.Parameters.AddWithValue("codeHash", verificationCodeHash);
+
+        await challengeCommand.ExecuteNonQueryAsync();
+
         await transaction.CommitAsync();
 
-        return Results.Created($"/api/users/{userId}", new
+        if (environment.IsDevelopment())
         {
-            id = userId,
-            firstName,
-            lastName,
-            email = hasEmail ? email : null,
-            phoneNumber = hasPhone ? phoneNumber : null,
-            isVerified = false
+            return Results.Created($"/api/users/{userId}", new
+            {
+                id = userId,
+                firstName,
+                lastName,
+                email = hasEmail ? email : null,
+                phoneNumber = hasPhone ? phoneNumber : null,
+                isVerified = false,
+                developmentCode = verificationCode,
+                expiresInSeconds = 300
+            });
+        }
+
+        return Results.Accepted(value: new
+        {
+            message = "Registration received. Verification is required."
         });
     }
     catch (Npgsql.PostgresException ex)
@@ -176,10 +230,10 @@ app.MapPost("/api/users/register", async (
 
 app.MapPost("/api/users/{userId:long}/verification-challenges", async (
     long userId,
-    Npgsql.NpgsqlConnection connection,
+    Npgsql.NpgsqlDataSource dataSource,
     IWebHostEnvironment environment) =>
 {
-    await connection.OpenAsync();
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     const string findContactSql = """
         SELECT id, 'email' AS contact_type
@@ -276,7 +330,7 @@ app.MapPost("/api/users/{userId:long}/verification-challenges", async (
 app.MapPost("/api/users/{userId:long}/verify-contact", async (
     long userId,
     VerifyContactRequest request,
-    Npgsql.NpgsqlConnection connection) =>
+    Npgsql.NpgsqlDataSource dataSource) =>
 {
     if (request.Code is null ||
         request.Code.Length != 6 ||
@@ -288,7 +342,7 @@ app.MapPost("/api/users/{userId:long}/verify-contact", async (
         });
     }
 
-    await connection.OpenAsync();
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     await using var transaction = await connection.BeginTransactionAsync();
 
@@ -441,11 +495,602 @@ app.MapPost("/api/users/{userId:long}/verify-contact", async (
     }
 });
 
+app.MapPost("/api/auth/verify-registration", async (
+    VerifyRegistrationRequest request,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var email = request.Email?.Trim();
+    var phoneNumber = request.PhoneNumber?.Trim();
+
+    var hasEmail = !string.IsNullOrWhiteSpace(email);
+    var hasPhone = !string.IsNullOrWhiteSpace(phoneNumber);
+
+    if (hasEmail == hasPhone)
+    {
+        return Results.BadRequest(new
+        {
+            error = "Provide either an email address or a phone number, but not both."
+        });
+    }
+
+    if (request.Code is null ||
+        request.Code.Length != 6 ||
+        !request.Code.All(char.IsAsciiDigit))
+    {
+        return Results.BadRequest(new
+        {
+            error = "Enter a valid six-digit verification code."
+        });
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    const string findChallengeSql = """
+        SELECT
+            ac.id,
+            ac.user_email_id,
+            ac.user_phone_id,
+            ac.code_hash,
+            ue.user_id AS email_user_id,
+            up.user_id AS phone_user_id
+        FROM auth_challenges ac
+        LEFT JOIN user_emails ue
+            ON ue.id = ac.user_email_id
+        LEFT JOIN user_phones up
+            ON up.id = ac.user_phone_id
+        WHERE
+            (
+                (@hasEmail = TRUE AND ue.email = @email)
+                OR
+                (@hasPhone = TRUE AND up.phone_number = @phoneNumber)
+            )
+            AND ac.consumed_at IS NULL
+            AND ac.expires_at > NOW()
+            AND ac.failed_attempts < 5
+        ORDER BY ac.created_at DESC
+        LIMIT 1
+        FOR UPDATE OF ac;
+        """;
+
+    await using var findCommand = new Npgsql.NpgsqlCommand(
+        findChallengeSql, connection, transaction);
+
+    findCommand.Parameters.AddWithValue("hasEmail", hasEmail);
+    findCommand.Parameters.AddWithValue(
+        "email", (object?)email ?? DBNull.Value);
+    findCommand.Parameters.AddWithValue(
+        "hasPhone", hasPhone);
+    findCommand.Parameters.AddWithValue(
+        "phoneNumber", (object?)phoneNumber ?? DBNull.Value);
+
+    long challengeId;
+    long userId;
+    long? emailId;
+    long? phoneId;
+    byte[] storedHash;
+
+    await using (var reader = await findCommand.ExecuteReaderAsync())
+    {
+        if (!await reader.ReadAsync())
+        {
+            await reader.DisposeAsync();
+            await transaction.RollbackAsync();
+
+            return Results.BadRequest(new
+            {
+                error = "The verification code is incorrect or expired."
+            });
+        }
+
+        challengeId = reader.GetInt64(0);
+        emailId = reader.IsDBNull(1) ? null : reader.GetInt64(1);
+        phoneId = reader.IsDBNull(2) ? null : reader.GetInt64(2);
+        storedHash = Convert.FromHexString(reader.GetString(3));
+        userId = reader.GetInt64(hasEmail ? 4 : 5);
+    }
+
+    var submittedHash = SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes(request.Code));
+
+    if (!CryptographicOperations.FixedTimeEquals(
+            storedHash, submittedHash))
+    {
+        const string incrementAttemptsSql = """
+            UPDATE auth_challenges
+            SET failed_attempts = failed_attempts + 1
+            WHERE id = @challengeId
+              AND failed_attempts < 5;
+            """;
+
+        await using var attemptsCommand = new Npgsql.NpgsqlCommand(
+            incrementAttemptsSql, connection, transaction);
+
+        attemptsCommand.Parameters.AddWithValue(
+            "challengeId", challengeId);
+
+        await attemptsCommand.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+
+        return Results.BadRequest(new
+        {
+            error = "The verification code is incorrect or expired."
+        });
+    }
+
+    const string consumeChallengeSql = """
+        UPDATE auth_challenges
+        SET consumed_at = NOW()
+        WHERE id = @challengeId
+          AND consumed_at IS NULL
+          AND expires_at > NOW()
+          AND failed_attempts < 5;
+        """;
+
+    await using var consumeCommand = new Npgsql.NpgsqlCommand(
+        consumeChallengeSql, connection, transaction);
+
+    consumeCommand.Parameters.AddWithValue(
+        "challengeId", challengeId);
+
+    var consumed = await consumeCommand.ExecuteNonQueryAsync();
+
+    if (consumed != 1)
+    {
+        await transaction.RollbackAsync();
+
+        return Results.BadRequest(new
+        {
+            error = "The verification challenge is no longer valid."
+        });
+    }
+
+    var verifyContactSql = hasEmail
+        ? """
+          UPDATE user_emails
+          SET is_verified = TRUE, verified_at = NOW()
+          WHERE id = @contactId AND is_verified = FALSE;
+          """
+        : """
+          UPDATE user_phones
+          SET is_verified = TRUE, verified_at = NOW()
+          WHERE id = @contactId AND is_verified = FALSE;
+          """;
+
+    await using var verifyCommand = new Npgsql.NpgsqlCommand(
+        verifyContactSql, connection, transaction);
+
+    verifyCommand.Parameters.AddWithValue(
+        "contactId", emailId ?? phoneId!.Value);
+
+    var updated = await verifyCommand.ExecuteNonQueryAsync();
+
+    if (updated != 1)
+    {
+        await transaction.RollbackAsync();
+
+        return Results.BadRequest(new
+        {
+            error = "The contact could not be verified."
+        });
+    }
+
+    var sessionToken = Convert.ToBase64String(
+            RandomNumberGenerator.GetBytes(32));
+
+    var sessionTokenHash = Convert.ToHexString(
+        SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(sessionToken)));
+
+    var sessionDuration = request.StayLoggedIn
+        ? TimeSpan.FromDays(30)
+        : TimeSpan.FromHours(24);
+
+    const string insertSessionSql = """
+        INSERT INTO auth_sessions (
+            user_id,
+            token_hash,
+            stay_logged_in,
+            expires_at
+        )
+        VALUES (
+            @userId,
+            @tokenHash,
+            @stayLoggedIn,
+            NOW() + @sessionDuration
+        )
+        RETURNING id, expires_at;
+        """;
+
+    long sessionId;
+    DateTime expiresAt;
+
+    await using (var sessionCommand = new Npgsql.NpgsqlCommand(
+        insertSessionSql, connection, transaction))
+    {
+        sessionCommand.Parameters.AddWithValue("userId", userId);
+        sessionCommand.Parameters.AddWithValue(
+            "tokenHash", sessionTokenHash);
+        sessionCommand.Parameters.AddWithValue(
+            "stayLoggedIn", request.StayLoggedIn);
+        sessionCommand.Parameters.AddWithValue(
+            "sessionDuration", sessionDuration);
+
+        await using var sessionReader =
+            await sessionCommand.ExecuteReaderAsync();
+
+        await sessionReader.ReadAsync();
+
+        sessionId = sessionReader.GetInt64(0);
+        expiresAt = sessionReader.GetDateTime(1);
+    }
+
+    await transaction.CommitAsync();
+
+    return Results.Ok(new
+    {
+        message = "Registration completed successfully.",
+        userId,
+        isVerified = true,
+        sessionId,
+        sessionToken,
+        stayLoggedIn = request.StayLoggedIn,
+        expiresAt
+    });
+});
+
+app.MapPost("/api/auth/request-code", async (
+    LoginCodeRequest request,
+    Npgsql.NpgsqlDataSource dataSource,
+    IWebHostEnvironment environment) =>
+{
+    var email = request.Email?.Trim();
+
+    if (string.IsNullOrWhiteSpace(email) ||
+        !string.IsNullOrWhiteSpace(request.PhoneNumber))
+    {
+        return Results.Ok(new
+        {
+            message = "If the verified account exists, a login code will be sent."
+        });
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    const string findEmailSql = """
+        SELECT id
+        FROM user_emails
+        WHERE email = @email
+          AND is_verified = TRUE;
+        """;
+
+    await using var findCommand = new Npgsql.NpgsqlCommand(
+        findEmailSql, connection);
+
+    findCommand.Parameters.AddWithValue("email", email);
+
+    var result = await findCommand.ExecuteScalarAsync();
+
+    if (result is null)
+    {
+        return Results.Ok(new
+        {
+            message = "If the verified account exists, a login code will be sent."
+        });
+    }
+
+    var emailId = (long)result;
+
+    var code = RandomNumberGenerator.GetInt32(0, 1_000_000)
+        .ToString("D6");
+
+    var codeHash = Convert.ToHexString(
+        SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(code)));
+
+    const string insertChallengeSql = """
+        INSERT INTO auth_challenges (
+            user_email_id,
+            user_phone_id,
+            code_hash,
+            expires_at
+        )
+        VALUES (
+            @emailId,
+            NULL,
+            @codeHash,
+            NOW() + INTERVAL '5 minutes'
+        );
+        """;
+
+    await using var insertCommand = new Npgsql.NpgsqlCommand(
+        insertChallengeSql, connection);
+
+    insertCommand.Parameters.AddWithValue("emailId", emailId);
+    insertCommand.Parameters.AddWithValue("codeHash", codeHash);
+
+    await insertCommand.ExecuteNonQueryAsync();
+
+    if (environment.IsDevelopment())
+    {
+        return Results.Ok(new
+        {
+            message = "Login challenge created.",
+            developmentCode = code,
+            expiresInSeconds = 300
+        });
+    }
+
+    return Results.Ok(new
+    {
+        message = "If the verified account exists, a login code will be sent."
+    });
+});
+
+app.MapPost("/api/auth/verify-code", async (
+    VerifyLoginCodeRequest request,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var email = request.Email?.Trim();
+
+    if (string.IsNullOrWhiteSpace(email) ||
+        string.IsNullOrWhiteSpace(request.Code) ||
+        request.Code.Length != 6 ||
+        !request.Code.All(char.IsAsciiDigit))
+    {
+        return Results.BadRequest(new
+        {
+            error = "Provide an email address and a valid six-digit code."
+        });
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    try
+    {
+        const string findChallengeSql = """
+            SELECT
+                ac.id,
+                ac.code_hash,
+                ue.user_id
+            FROM auth_challenges ac
+            JOIN user_emails ue
+                ON ue.id = ac.user_email_id
+            WHERE ue.email = @email
+              AND ue.is_verified = TRUE
+              AND ac.user_phone_id IS NULL
+              AND ac.consumed_at IS NULL
+              AND ac.expires_at > NOW()
+              AND ac.failed_attempts < 5
+            ORDER BY ac.created_at DESC
+            LIMIT 1
+            FOR UPDATE OF ac;
+            """;
+
+        await using var findCommand = new Npgsql.NpgsqlCommand(
+            findChallengeSql, connection, transaction);
+
+        findCommand.Parameters.AddWithValue("email", email);
+
+        long challengeId;
+        long userId;
+        byte[] storedHash;
+
+        await using (var reader = await findCommand.ExecuteReaderAsync())
+        {
+            if (!await reader.ReadAsync())
+            {
+                return Results.BadRequest(new
+                {
+                    error = "The login code is invalid or expired. Request a new code."
+                });
+            }
+
+            challengeId = reader.GetInt64(0);
+            storedHash = Convert.FromHexString(reader.GetString(1));
+            userId = reader.GetInt64(2);
+        }
+
+        var submittedHash = SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(request.Code));
+
+        if (!CryptographicOperations.FixedTimeEquals(
+                storedHash, submittedHash))
+        {
+            const string incrementAttemptsSql = """
+                UPDATE auth_challenges
+                SET failed_attempts = failed_attempts + 1
+                WHERE id = @challengeId
+                  AND failed_attempts < 5;
+                """;
+
+            await using var attemptsCommand = new Npgsql.NpgsqlCommand(
+                incrementAttemptsSql, connection, transaction);
+
+            attemptsCommand.Parameters.AddWithValue(
+                "challengeId", challengeId);
+
+            await attemptsCommand.ExecuteNonQueryAsync();
+            await transaction.CommitAsync();
+
+            return Results.BadRequest(new
+            {
+                error = "The login code is incorrect or expired."
+            });
+        }
+
+        const string consumeChallengeSql = """
+            UPDATE auth_challenges
+            SET consumed_at = NOW()
+            WHERE id = @challengeId
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+              AND failed_attempts < 5;
+            """;
+
+        await using var consumeCommand = new Npgsql.NpgsqlCommand(
+            consumeChallengeSql, connection, transaction);
+
+        consumeCommand.Parameters.AddWithValue(
+            "challengeId", challengeId);
+
+        var consumed = await consumeCommand.ExecuteNonQueryAsync();
+
+        if (consumed != 1)
+        {
+            await transaction.RollbackAsync();
+
+            return Results.BadRequest(new
+            {
+                error = "The login code is no longer valid."
+            });
+        }
+
+        var sessionToken = Convert.ToBase64String(
+            RandomNumberGenerator.GetBytes(32));
+
+        var tokenHash = Convert.ToHexString(
+            SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(sessionToken)));
+
+        var sessionDuration = request.StayLoggedIn
+            ? TimeSpan.FromDays(30)
+            : TimeSpan.FromHours(24);
+
+        const string insertSessionSql = """
+            INSERT INTO auth_sessions (
+                user_id,
+                token_hash,
+                stay_logged_in,
+                expires_at
+            )
+            VALUES (
+                @userId,
+                @tokenHash,
+                @stayLoggedIn,
+                NOW() + @sessionDuration
+            )
+            RETURNING id;
+            """;
+
+        await using var sessionCommand = new Npgsql.NpgsqlCommand(
+            insertSessionSql, connection, transaction);
+
+        sessionCommand.Parameters.AddWithValue("userId", userId);
+        sessionCommand.Parameters.AddWithValue("tokenHash", tokenHash);
+        sessionCommand.Parameters.AddWithValue(
+            "stayLoggedIn", request.StayLoggedIn);
+        sessionCommand.Parameters.AddWithValue(
+            "sessionDuration", sessionDuration);
+
+        var sessionId = (long)(
+            await sessionCommand.ExecuteScalarAsync())!;
+
+        await transaction.CommitAsync();
+
+        return Results.Ok(new
+        {
+            message = "Login successful.",
+            userId,
+            sessionId,
+            sessionToken,
+            stayLoggedIn = request.StayLoggedIn,
+            expiresInSeconds = (long)sessionDuration.TotalSeconds
+        });
+    }
+    catch
+    {
+        await transaction.RollbackAsync();
+        throw;
+    }
+});
+
+
+app.MapGet("/api/auth/me", async (
+    HttpRequest request,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator) =>
+{
+    var userId = await GymLogger.Api.Authentication.SessionAuthentication
+        .GetAuthenticatedUserIdAsync(request, sessionValidator);
+
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    return Results.Ok(new { userId });
+});
+
+
+app.MapPost("/api/auth/logout", async (
+    HttpRequest request,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var authorization = request.Headers.Authorization.ToString();
+
+    if (!authorization.StartsWith(
+        "Bearer ",
+        StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Unauthorized();
+    }
+
+    var sessionToken = authorization["Bearer ".Length..].Trim();
+
+    var userId = await sessionValidator.ValidateAsync(sessionToken);
+
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var tokenHash = Convert.ToHexString(
+        System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(sessionToken)));
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    const string sql = """
+        UPDATE auth_sessions
+        SET revoked_at = NOW()
+        WHERE token_hash = @tokenHash
+          AND revoked_at IS NULL;
+        """;
+
+    await using var command = new Npgsql.NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("tokenHash", tokenHash);
+
+    await command.ExecuteNonQueryAsync();
+
+    return Results.Ok(new { message = "Logged out successfully." });
+});
+
+
 app.MapGet("/api/users/{userId:long}/subscription", async (
     long userId,
-    Npgsql.NpgsqlConnection connection) =>
+    HttpRequest request,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator,
+    Npgsql.NpgsqlDataSource dataSource) =>
 {
-    await connection.OpenAsync();
+    var authenticatedUserId =
+    await GymLogger.Api.Authentication.SessionAuthentication
+        .GetAuthenticatedUserIdAsync(request, sessionValidator);
+
+    if (authenticatedUserId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    if (authenticatedUserId.Value != userId)
+    {
+        return Results.Forbid();
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     const string sql = """
         SELECT
@@ -526,9 +1171,9 @@ app.MapGet("/api/users/{userId:long}/subscription", async (
     });
 });
 
-app.MapGet("/api/exercises", async (Npgsql.NpgsqlConnection connection) =>
+app.MapGet("/api/exercises", async (Npgsql.NpgsqlDataSource dataSource) =>
 {
-    await connection.OpenAsync();
+    await using var connection = await dataSource.OpenConnectionAsync();
 
     const string sql = """
         SELECT
@@ -578,7 +1223,7 @@ app.MapGet("/api/exercises", async (Npgsql.NpgsqlConnection connection) =>
 
 app.MapGet("/weatherforecast", () =>
 {
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
+    var forecast = Enumerable.Range(1, 5).Select(index =>
         new WeatherForecast
         (
             DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
@@ -611,3 +1256,14 @@ record VerifyContactRequest(
 record LoginCodeRequest(
     string? Email,
     string? PhoneNumber);
+
+record VerifyLoginCodeRequest(
+    string Email,
+    string Code,
+    bool StayLoggedIn);
+
+record VerifyRegistrationRequest(
+    string? Email,
+    string? PhoneNumber,
+    string Code,
+    bool StayLoggedIn);
