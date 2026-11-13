@@ -80,7 +80,6 @@ a {
 /* ========================================
    Header
    ======================================== */
-
 .app-header {
     min-height: 84px;
     display: flex;
@@ -88,6 +87,7 @@ a {
     justify-content: space-between;
     gap: 1rem;
     border-bottom: 1px solid var(--color-border);
+    width: 100%;
 }
 
 .app-logo {
@@ -409,3 +409,110 @@ a {
         font-weight: 700;
         font-size: 22px;
     }
+
+.app-header .dashboard-options {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    width: auto;
+    max-width: none;
+    margin: 0 0 0 auto;
+    padding: 0;
+}
+
+    .app-header .dashboard-options .button {
+        width: auto;
+        min-width: 100px;
+        flex: 0 0 auto;
+    }
+
+/* Workout Set Entry Form */
+.set-entry-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    width: 100%;
+    max-width: 360px;
+    margin: 2rem auto;
+}
+
+.set-entry-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    text-align: left;
+    font-weight: 600;
+}
+
+.set-entry-form input {
+    display: block;
+    width: 100%;
+    min-height: 52px;
+    padding: 14px 16px;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--color-surface);
+    color: var(--color-text);
+}
+
+    .set-entry-form input:focus {
+        border-color: var(--color-text);
+        outline: none;
+    }
+
+.set-entry-form + .button {
+    margin-top: 0.5rem;
+}
+
+
+/* Completed Workout Report */
+.completed-sets {
+    width: 100%;
+    max-width: 520px;
+    margin: 2.5rem auto;
+    padding: 1.5rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--border-radius);
+    background: var(--color-surface);
+    text-align: center;
+}
+
+.completed-sets h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.5rem;
+}
+
+.completed-sets-exercise {
+    margin: 0 0 1.5rem;
+    color: var(--color-text-secondary);
+    font-size: 1.1rem;
+}
+
+.completed-sets table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 auto;
+}
+
+.completed-sets th,
+.completed-sets td {
+    padding: 0.85rem 0.5rem;
+    text-align: center;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.completed-sets th {
+    font-weight: 700;
+    color: var(--color-text-secondary);
+}
+
+.completed-sets tbody tr:last-child td {
+    border-bottom: none;
+}
+.completed-exercise + .completed-exercise {
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--color-border);
+}

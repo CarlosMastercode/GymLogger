@@ -1,4 +1,6 @@
 using System.Security.Cryptography;
+using System.Text;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -6,7 +8,11 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("GymLoggerWeb", policy =>
     {
-        policy.WithOrigins("http://localhost:5173")
+        var origins = builder.Configuration
+            .GetSection("Cors:AllowedOrigins")
+            .Get<string[]>() ?? ["http://localhost:5173"];
+
+        policy.WithOrigins(origins)
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
@@ -23,6 +29,32 @@ builder.Services.AddSingleton(
     Npgsql.NpgsqlDataSource.Create(connectionString));
 
 builder.Services.AddScoped<GymLogger.Api.Authentication.SessionValidator>();
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("auth-challenge", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+});
+
+var challengeHmacKey = builder.Configuration["Authentication:ChallengeHmacKey"];
+
+if (string.IsNullOrWhiteSpace(challengeHmacKey))
+{
+    throw new InvalidOperationException(
+        "Authentication:ChallengeHmacKey is required.");
+}
+
+var challengeHmacKeyBytes = Encoding.UTF8.GetBytes(challengeHmacKey);
+
+static string HashChallengeCode(string code, byte[] key) =>
+    Convert.ToHexString(
+        HMACSHA256.HashData(key, Encoding.UTF8.GetBytes(code)));
 
 var app = builder.Build();
 
@@ -36,6 +68,7 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors("GymLoggerWeb");
 app.UseHttpsRedirection();
+app.UseRateLimiter();
 
 var summaries = new[]
 {
@@ -67,7 +100,7 @@ app.MapPost("/api/users/register", async (
 {
     var firstName = request.FirstName?.Trim();
     var lastName = request.LastName?.Trim();
-    var email = request.Email?.Trim();
+    var email = request.Email?.Trim().ToLowerInvariant();
     var phoneNumber = request.PhoneNumber?.Trim();
 
     if (string.IsNullOrWhiteSpace(firstName) ||
@@ -156,9 +189,9 @@ app.MapPost("/api/users/register", async (
         var verificationCode = RandomNumberGenerator.GetInt32(0, 1_000_000)
             .ToString("D6");
 
-        var verificationCodeHash = Convert.ToHexString(
-            SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(verificationCode)));
+        var verificationCodeHash = HashChallengeCode(
+            verificationCode,
+            challengeHmacKeyBytes);
 
         const string insertChallengeSql = """
             INSERT INTO auth_challenges (
@@ -278,8 +311,7 @@ app.MapPost("/api/users/{userId:long}/verification-challenges", async (
     var code = RandomNumberGenerator.GetInt32(0, 1_000_000)
         .ToString("D6");
 
-    var codeHash = Convert.ToHexString(
-        SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(code)));
+    var codeHash = HashChallengeCode(code, challengeHmacKeyBytes);
 
     const string insertChallengeSql = """
         INSERT INTO auth_challenges (
@@ -325,7 +357,8 @@ app.MapPost("/api/users/{userId:long}/verification-challenges", async (
     {
         message = "If the account requires verification, a code will be sent."
     });
-});
+})
+.RequireRateLimiting("auth-challenge");
 
 app.MapPost("/api/users/{userId:long}/verify-contact", async (
     long userId,
@@ -395,8 +428,9 @@ app.MapPost("/api/users/{userId:long}/verify-contact", async (
             storedHash = Convert.FromHexString(reader.GetString(3));
         }
 
-        var submittedHash = SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(request.Code));
+        var submittedHash = HMACSHA256.HashData(
+            challengeHmacKeyBytes,
+            Encoding.UTF8.GetBytes(request.Code));
 
         if (!CryptographicOperations.FixedTimeEquals(
                 storedHash, submittedHash))
@@ -499,7 +533,7 @@ app.MapPost("/api/auth/verify-registration", async (
     VerifyRegistrationRequest request,
     Npgsql.NpgsqlDataSource dataSource) =>
 {
-    var email = request.Email?.Trim();
+    var email = request.Email?.Trim().ToLowerInvariant();
     var phoneNumber = request.PhoneNumber?.Trim();
 
     var hasEmail = !string.IsNullOrWhiteSpace(email);
@@ -591,8 +625,9 @@ app.MapPost("/api/auth/verify-registration", async (
         userId = reader.GetInt64(hasEmail ? 4 : 5);
     }
 
-    var submittedHash = SHA256.HashData(
-        System.Text.Encoding.UTF8.GetBytes(request.Code));
+    var submittedHash = HMACSHA256.HashData(
+        challengeHmacKeyBytes,
+        Encoding.UTF8.GetBytes(request.Code));
 
     if (!CryptographicOperations.FixedTimeEquals(
             storedHash, submittedHash))
@@ -740,12 +775,222 @@ app.MapPost("/api/auth/verify-registration", async (
     });
 });
 
+
+app.MapPost("/api/auth/verify-login", async (
+    VerifyRegistrationRequest request,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var email = request.Email?.Trim().ToLowerInvariant();
+    var phoneNumber = request.PhoneNumber?.Trim();
+
+    var hasEmail = !string.IsNullOrWhiteSpace(email);
+    var hasPhone = !string.IsNullOrWhiteSpace(phoneNumber);
+
+    if (hasEmail == hasPhone)
+    {
+        return Results.BadRequest(new
+        {
+            error = "Provide either an email address or a phone number, but not both."
+        });
+    }
+
+    if (request.Code is null ||
+        request.Code.Length != 6 ||
+        !request.Code.All(char.IsAsciiDigit))
+    {
+        return Results.BadRequest(new
+        {
+            error = "Enter a valid six-digit verification code."
+        });
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    const string findChallengeSql = """
+        SELECT
+            ac.id,
+            ac.code_hash,
+            COALESCE(ue.user_id, up.user_id) AS user_id
+        FROM auth_challenges ac
+        LEFT JOIN user_emails ue
+            ON ue.id = ac.user_email_id
+        LEFT JOIN user_phones up
+            ON up.id = ac.user_phone_id
+        WHERE
+            (
+                (@hasEmail = TRUE
+                    AND ue.email = @email
+                    AND ue.is_verified = TRUE)
+                OR
+                (@hasPhone = TRUE
+                    AND up.phone_number = @phoneNumber
+                    AND up.is_verified = TRUE)
+            )
+            AND ac.consumed_at IS NULL
+            AND ac.expires_at > NOW()
+            AND ac.failed_attempts < 5
+        ORDER BY ac.created_at DESC
+        LIMIT 1
+        FOR UPDATE OF ac;
+        """;
+
+    await using var findCommand = new Npgsql.NpgsqlCommand(
+        findChallengeSql, connection, transaction);
+
+    findCommand.Parameters.AddWithValue("hasEmail", hasEmail);
+    findCommand.Parameters.AddWithValue(
+        "email", (object?)email ?? DBNull.Value);
+    findCommand.Parameters.AddWithValue(
+        "hasPhone", hasPhone);
+    findCommand.Parameters.AddWithValue(
+        "phoneNumber", (object?)phoneNumber ?? DBNull.Value);
+
+    long challengeId;
+    long userId;
+    byte[] storedHash;
+
+    await using (var reader = await findCommand.ExecuteReaderAsync())
+    {
+        if (!await reader.ReadAsync())
+        {
+            await reader.DisposeAsync();
+            await transaction.RollbackAsync();
+
+            return Results.BadRequest(new
+            {
+                error = "The login code is incorrect or expired."
+            });
+        }
+
+        challengeId = reader.GetInt64(0);
+        storedHash = Convert.FromHexString(reader.GetString(1));
+        userId = reader.GetInt64(2);
+    }
+
+    var submittedHash = HMACSHA256.HashData(
+        challengeHmacKeyBytes,
+        Encoding.UTF8.GetBytes(request.Code));
+
+    if (!CryptographicOperations.FixedTimeEquals(
+            storedHash, submittedHash))
+    {
+        const string incrementAttemptsSql = """
+            UPDATE auth_challenges
+            SET failed_attempts = failed_attempts + 1
+            WHERE id = @challengeId
+              AND failed_attempts < 5;
+            """;
+
+        await using var attemptsCommand = new Npgsql.NpgsqlCommand(
+            incrementAttemptsSql, connection, transaction);
+
+        attemptsCommand.Parameters.AddWithValue(
+            "challengeId", challengeId);
+
+        await attemptsCommand.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+
+        return Results.BadRequest(new
+        {
+            error = "The login code is incorrect or expired."
+        });
+    }
+
+    const string consumeChallengeSql = """
+        UPDATE auth_challenges
+        SET consumed_at = NOW()
+        WHERE id = @challengeId
+          AND consumed_at IS NULL
+          AND expires_at > NOW()
+          AND failed_attempts < 5;
+        """;
+
+    await using var consumeCommand = new Npgsql.NpgsqlCommand(
+        consumeChallengeSql, connection, transaction);
+
+    consumeCommand.Parameters.AddWithValue(
+        "challengeId", challengeId);
+
+    if (await consumeCommand.ExecuteNonQueryAsync() != 1)
+    {
+        await transaction.RollbackAsync();
+
+        return Results.BadRequest(new
+        {
+            error = "The login challenge is no longer valid."
+        });
+    }
+
+    var sessionToken = Convert.ToBase64String(
+        RandomNumberGenerator.GetBytes(32));
+
+    var sessionTokenHash = Convert.ToHexString(
+        SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(sessionToken)));
+
+    var sessionDuration = request.StayLoggedIn
+        ? TimeSpan.FromDays(30)
+        : TimeSpan.FromHours(24);
+
+    const string insertSessionSql = """
+        INSERT INTO auth_sessions (
+            user_id,
+            token_hash,
+            stay_logged_in,
+            expires_at
+        )
+        VALUES (
+            @userId,
+            @tokenHash,
+            @stayLoggedIn,
+            NOW() + @sessionDuration
+        )
+        RETURNING id, expires_at;
+        """;
+
+    long sessionId;
+    DateTime expiresAt;
+
+    await using (var sessionCommand = new Npgsql.NpgsqlCommand(
+        insertSessionSql, connection, transaction))
+    {
+        sessionCommand.Parameters.AddWithValue("userId", userId);
+        sessionCommand.Parameters.AddWithValue(
+            "tokenHash", sessionTokenHash);
+        sessionCommand.Parameters.AddWithValue(
+            "stayLoggedIn", request.StayLoggedIn);
+        sessionCommand.Parameters.AddWithValue(
+            "sessionDuration", sessionDuration);
+
+        await using var sessionReader =
+            await sessionCommand.ExecuteReaderAsync();
+
+        await sessionReader.ReadAsync();
+
+        sessionId = sessionReader.GetInt64(0);
+        expiresAt = sessionReader.GetDateTime(1);
+    }
+
+    await transaction.CommitAsync();
+
+    return Results.Ok(new
+    {
+        message = "Login successful.",
+        userId,
+        sessionId,
+        sessionToken,
+        stayLoggedIn = request.StayLoggedIn,
+        expiresAt
+    });
+});
+
 app.MapPost("/api/auth/request-code", async (
     LoginCodeRequest request,
     Npgsql.NpgsqlDataSource dataSource,
     IWebHostEnvironment environment) =>
 {
-    var email = request.Email?.Trim();
+    var email = request.Email?.Trim().ToLowerInvariant();
 
     if (string.IsNullOrWhiteSpace(email) ||
         !string.IsNullOrWhiteSpace(request.PhoneNumber))
@@ -785,9 +1030,7 @@ app.MapPost("/api/auth/request-code", async (
     var code = RandomNumberGenerator.GetInt32(0, 1_000_000)
         .ToString("D6");
 
-    var codeHash = Convert.ToHexString(
-        SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(code)));
+    var codeHash = HashChallengeCode(code, challengeHmacKeyBytes);
 
     const string insertChallengeSql = """
         INSERT INTO auth_challenges (
@@ -826,13 +1069,14 @@ app.MapPost("/api/auth/request-code", async (
     {
         message = "If the verified account exists, a login code will be sent."
     });
-});
+})
+.RequireRateLimiting("auth-challenge");
 
 app.MapPost("/api/auth/verify-code", async (
     VerifyLoginCodeRequest request,
     Npgsql.NpgsqlDataSource dataSource) =>
 {
-    var email = request.Email?.Trim();
+    var email = request.Email?.Trim().ToLowerInvariant();
 
     if (string.IsNullOrWhiteSpace(email) ||
         string.IsNullOrWhiteSpace(request.Code) ||
@@ -894,8 +1138,9 @@ app.MapPost("/api/auth/verify-code", async (
             userId = reader.GetInt64(2);
         }
 
-        var submittedHash = SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(request.Code));
+        var submittedHash = HMACSHA256.HashData(
+            challengeHmacKeyBytes,
+            Encoding.UTF8.GetBytes(request.Code));
 
         if (!CryptographicOperations.FixedTimeEquals(
                 storedHash, submittedHash))
@@ -1171,6 +1416,225 @@ app.MapGet("/api/users/{userId:long}/subscription", async (
     });
 });
 
+app.MapPost("/api/workouts/sessions", async (
+    HttpRequest request,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var userId = await GymLogger.Api.Authentication.SessionAuthentication
+        .GetAuthenticatedUserIdAsync(request, sessionValidator);
+
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    const string existingSessionSql = """
+        SELECT id, started_at
+        FROM workout_sessions
+        WHERE user_id = @userId
+          AND status = 'in_progress'
+        ORDER BY started_at DESC
+        LIMIT 1;
+        """;
+
+    await using var existingSessionCommand = new Npgsql.NpgsqlCommand(
+        existingSessionSql,
+        connection);
+    existingSessionCommand.Parameters.AddWithValue("userId", userId.Value);
+
+    await using var existingSessionReader =
+        await existingSessionCommand.ExecuteReaderAsync();
+
+    if (await existingSessionReader.ReadAsync())
+    {
+        return Results.Ok(new
+        {
+            id = existingSessionReader.GetInt64(0),
+            startedAt = existingSessionReader.GetFieldValue<DateTimeOffset>(1),
+            status = "in_progress"
+        });
+    }
+
+    await existingSessionReader.DisposeAsync();
+
+    const string sql = """
+        INSERT INTO workout_sessions (user_id)
+        VALUES (@userId)
+        RETURNING id, started_at;
+        """;
+
+    await using var command = new Npgsql.NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("userId", userId.Value);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    await reader.ReadAsync();
+
+    return Results.Created(
+        $"/api/workouts/sessions/{reader.GetInt64(0)}",
+        new
+        {
+            id = reader.GetInt64(0),
+            startedAt = reader.GetFieldValue<DateTimeOffset>(1),
+            status = "in_progress"
+        });
+});
+
+app.MapPost("/api/workouts/sessions/{sessionId:long}/sets", async (
+    long sessionId,
+    LogWorkoutSetRequest request,
+    HttpRequest httpRequest,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var userId = await GymLogger.Api.Authentication.SessionAuthentication
+        .GetAuthenticatedUserIdAsync(httpRequest, sessionValidator);
+
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    if (request.Weight < 0 || request.Reps < 1)
+    {
+        return Results.BadRequest(new
+        {
+            error = "Weight must be non-negative and reps must be at least one."
+        });
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    const string sql = """
+        INSERT INTO workout_sets (
+            session_id,
+            exercise_id,
+            set_number,
+            weight,
+            reps
+        )
+        SELECT
+            ws.id,
+            @exerciseId,
+            COALESCE(MAX(existing.set_number), 0) + 1,
+            @weight,
+            @reps
+        FROM workout_sessions ws
+        LEFT JOIN workout_sets existing
+            ON existing.session_id = ws.id
+           AND existing.exercise_id = @exerciseId
+        WHERE ws.id = @sessionId
+          AND ws.user_id = @userId
+          AND ws.status = 'in_progress'
+        GROUP BY ws.id
+        RETURNING id, set_number, logged_at;
+        """;
+
+    await using var command = new Npgsql.NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("sessionId", sessionId);
+    command.Parameters.AddWithValue("userId", userId.Value);
+    command.Parameters.AddWithValue("exerciseId", request.ExerciseId);
+    command.Parameters.AddWithValue("weight", request.Weight);
+    command.Parameters.AddWithValue("reps", request.Reps);
+
+    await using var reader = await command.ExecuteReaderAsync();
+
+    if (!await reader.ReadAsync())
+    {
+        return Results.NotFound(new
+        {
+            error = "An active workout session owned by the current user was not found."
+        });
+    }
+
+    return Results.Created(
+        $"/api/workouts/sessions/{sessionId}/sets/{reader.GetInt64(0)}",
+        new
+        {
+            id = reader.GetInt64(0),
+            setNumber = reader.GetInt32(1),
+            loggedAt = reader.GetFieldValue<DateTimeOffset>(2)
+        });
+});
+
+app.MapGet("/api/workouts/sessions", async (
+    HttpRequest request,
+    GymLogger.Api.Authentication.SessionValidator sessionValidator,
+    Npgsql.NpgsqlDataSource dataSource) =>
+{
+    var userId = await GymLogger.Api.Authentication.SessionAuthentication
+        .GetAuthenticatedUserIdAsync(request, sessionValidator);
+
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    await using var connection = await dataSource.OpenConnectionAsync();
+
+    const string sql = """
+        SELECT
+            ws.id,
+            ws.started_at,
+            ws.ended_at,
+            ws.status,
+            wset.id,
+            wset.exercise_id,
+            e.name,
+            wset.set_number,
+            wset.weight,
+            wset.reps,
+            wset.logged_at
+        FROM workout_sessions ws
+        LEFT JOIN workout_sets wset
+            ON wset.session_id = ws.id
+        LEFT JOIN exercises e
+            ON e.id = wset.exercise_id
+        WHERE ws.user_id = @userId
+        ORDER BY ws.started_at DESC, wset.logged_at;
+        """;
+
+    await using var command = new Npgsql.NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("userId", userId.Value);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    var sessions = new Dictionary<long, WorkoutSessionResponse>();
+
+    while (await reader.ReadAsync())
+    {
+        var sessionId = reader.GetInt64(0);
+
+        if (!sessions.TryGetValue(sessionId, out var session))
+        {
+            session = new WorkoutSessionResponse(
+                sessionId,
+                reader.GetFieldValue<DateTimeOffset>(1),
+                reader.IsDBNull(2)
+                    ? null
+                    : reader.GetFieldValue<DateTimeOffset>(2),
+                reader.GetString(3),
+                []);
+            sessions.Add(sessionId, session);
+        }
+
+        if (!reader.IsDBNull(4))
+        {
+            session.Sets.Add(new WorkoutSetResponse(
+                reader.GetInt64(4),
+                reader.GetInt64(5),
+                reader.GetString(6),
+                reader.GetInt32(7),
+                reader.GetDecimal(8),
+                reader.GetInt32(9),
+                reader.GetFieldValue<DateTimeOffset>(10)));
+        }
+    }
+
+    return Results.Ok(sessions.Values);
+});
+
 app.MapGet("/api/exercises", async (Npgsql.NpgsqlDataSource dataSource) =>
 {
     await using var connection = await dataSource.OpenConnectionAsync();
@@ -1267,3 +1731,24 @@ record VerifyRegistrationRequest(
     string? PhoneNumber,
     string Code,
     bool StayLoggedIn);
+
+record LogWorkoutSetRequest(
+    long ExerciseId,
+    decimal Weight,
+    int Reps);
+
+sealed record WorkoutSessionResponse(
+    long Id,
+    DateTimeOffset StartedAt,
+    DateTimeOffset? EndedAt,
+    string Status,
+    List<WorkoutSetResponse> Sets);
+
+record WorkoutSetResponse(
+    long Id,
+    long ExerciseId,
+    string ExerciseName,
+    int SetNumber,
+    decimal Weight,
+    int Reps,
+    DateTimeOffset LoggedAt);
