@@ -428,6 +428,9 @@ test-results/
 # General
 .DS_Store
 .AppleDouble
+
+# Local review notes
+/Claude/
 .LSOverride
 
 # Icon must end with two \r
